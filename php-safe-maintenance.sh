@@ -37,6 +37,8 @@ OPT_TO=""
 # php.ini) rather than prompting or overwriting them. This avoids the dpkg
 # conffile prompt that otherwise stalls an unattended run.
 export DEBIAN_FRONTEND=noninteractive
+# php.ini is managed by ucf, which ignores the dpkg conffile options below.
+export UCF_FORCE_CONFFOLD=1
 APT_OPTS=(-y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
 # ondrej/php renamed its PPA label; apt exits 100 until that change is accepted.
 APT_UPDATE_OPTS=(-o Acquire::AllowReleaseInfoChange::Label=true)
@@ -481,6 +483,24 @@ restart_active_handlers() {
   fi
 }
 
+# Run apt-get install, then judge success by the requested PHP packages only.
+# An unrelated half-configured package (e.g. shim-signed on EC2) makes apt-get
+# exit non-zero even when every PHP package installed cleanly.
+apt_install_php() {
+  local pkg status
+  local -a requested=() broken=()
+  for pkg in "$@"; do [[ "$pkg" == -* ]] || requested+=("$pkg"); done
+  if ! apt-get "${APT_OPTS[@]}" install "$@" 2>&1 | tee -a "$LOG_FILE"; then
+    log "WARNING: apt-get reported an error. Checking whether the PHP packages themselves installed cleanly."
+  fi
+  for pkg in "${requested[@]}"; do
+    status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null || true)"
+    [[ "$status" == "ii"* ]] || broken+=("${pkg}(${status:-missing})")
+  done
+  ((${#broken[@]} == 0)) || die "These PHP packages are not fully installed: ${broken[*]}"
+  log "All ${#requested[@]} requested PHP packages are installed and configured."
+}
+
 # Upgrade only the already-installed packages of one branch. No prompt, backup,
 # apt update, or service restart here; the caller owns those.
 _upgrade_branch_pkgs() {
@@ -497,7 +517,7 @@ _upgrade_branch_pkgs() {
     printf '  %-34s %s\n' "$pkg" "${candidate:-unknown}"
   done
   log "Upgrading installed PHP ${branch} packages only."
-  apt-get "${APT_OPTS[@]}" install --only-upgrade "${packages[@]}" 2>&1 | tee -a "$LOG_FILE"
+  apt_install_php --only-upgrade "${packages[@]}"
 }
 
 update_branch_packages() {
@@ -686,7 +706,7 @@ migrate_fpm() {
   printf '  %s\n' "${install_list[@]}"
   ask_yes_no "Proceed with this migration?" || { log "Cancelled."; return 0; }
 
-  apt-get "${APT_OPTS[@]}" install "${install_list[@]}" 2>&1 | tee -a "$LOG_FILE"
+  apt_install_php "${install_list[@]}"
   [[ -f "$new_ini" && -e "$new_conf" ]] || die "PHP ${to} FPM config files missing; Apache has not been switched."
 
   local directive
