@@ -38,6 +38,8 @@ OPT_TO=""
 # conffile prompt that otherwise stalls an unattended run.
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
+# ondrej/php renamed its PPA label; apt exits 100 until that change is accepted.
+APT_UPDATE_OPTS=(-o Acquire::AllowReleaseInfoChange::Label=true)
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -508,7 +510,7 @@ update_branch_packages() {
 
   backup_config
   log "Refreshing apt metadata."
-  apt-get update 2>&1 | tee -a "$LOG_FILE"
+  apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"
   require_cve_candidate "$branch"
   ask_yes_no "Proceed with package upgrade?" || { log "Cancelled before package upgrade."; return 0; }
 
@@ -530,7 +532,7 @@ update_all_branches() {
 
   backup_config
   log "Refreshing apt metadata."
-  apt-get update 2>&1 | tee -a "$LOG_FILE"
+  apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"
   ask_yes_no "Proceed with upgrading all installed PHP branches?" || { log "Cancelled before upgrade."; return 0; }
 
   local -a skipped=()
@@ -649,7 +651,7 @@ migrate_fpm() {
 
   backup_config
   log "Refreshing apt metadata."
-  apt-get update 2>&1 | tee -a "$LOG_FILE"
+  apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"
 
   # Fail early (before installing anything) if the target branch is not available.
   has_candidate "php${to}-fpm" || die "No installable candidate for php${to}-fpm. Enable a repo that ships it first, e.g.:
