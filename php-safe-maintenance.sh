@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Safe Ubuntu/Apache PHP maintenance helper for patching the PHP engine
-# (e.g. the Oct 2026 PHP security releases) without breaking a running site.
+# without breaking a running site. Checks CVE-2026-109618 and CVE-2026-109619
+# (fixed in 8.2.35, 8.3.36, 8.4.27, 8.5.12; no upstream fix before 8.2).
 #
 # Actions:
 #   1 Audit only                       - report PHP/Apache state, change nothing.
@@ -27,6 +28,7 @@ BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
 
 # Runtime options (set by argument parsing below).
 ASSUME_YES=0
+SELF_CHECK=0
 OPT_ACTION=""
 OPT_FROM=""
 OPT_TO=""
@@ -56,6 +58,7 @@ Options:
   --from=X.Y        Source branch for migration, or branch to purge (action 5)
   --to=X.Y          Target PHP branch for migration
   -y, --yes         Assume "yes" to all prompts (unattended mode)
+  --self-check      Check the CVE version table and exit (no root, no changes)
   -h, --help        Show this help
 
 Examples:
@@ -95,6 +98,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -y|--yes)      ASSUME_YES=1 ;;
+      --self-check)  SELF_CHECK=1 ;;
       --audit-only)  OPT_ACTION=1 ;;
       --action=*)    OPT_ACTION="${1#*=}" ;;
       --from=*)      OPT_FROM="${1#*=}" ;;
@@ -108,20 +112,22 @@ parse_args() {
 
 parse_args "$@"
 
-[[ "${EUID}" -eq 0 ]] || { echo "Run with sudo: sudo ./${SCRIPT_NAME}" >&2; exit 1; }
-for cmd in apt-get apt-cache dpkg-query systemctl flock awk sed; do
-  have "$cmd" || { echo "Missing command: $cmd" >&2; exit 1; }
-done
+if [[ "$SELF_CHECK" -ne 1 ]]; then
+  [[ "${EUID}" -eq 0 ]] || { echo "Run with sudo: sudo ./${SCRIPT_NAME}" >&2; exit 1; }
+  for cmd in apt-get apt-cache dpkg-query systemctl flock awk sed; do
+    have "$cmd" || { echo "Missing command: $cmd" >&2; exit 1; }
+  done
 
-mkdir -p "$BACKUP_DIR"
-chmod 700 "$BACKUP_DIR"
-touch "$LOG_FILE"
-chmod 600 "$LOG_FILE"
-exec 9>/run/lock/php-safe-maintenance.lock
-flock -n 9 || { echo "Another copy of this script is running." >&2; exit 1; }
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  exec 9>/run/lock/php-safe-maintenance.lock
+  flock -n 9 || { echo "Another copy of this script is running." >&2; exit 1; }
 
-trap 'rc=$?; [[ $rc -ne 0 ]] && log "Aborted (exit ${rc}) at line ${LINENO}."; exit $rc' ERR
-log "Started. Backup directory: $BACKUP_DIR"
+  trap 'rc=$?; [[ $rc -ne 0 ]] && log "Aborted (exit ${rc}) at line ${LINENO}."; exit $rc' ERR
+  log "Started. Backup directory: $BACKUP_DIR"
+fi
 
 backup_config() {
   log "Backing up config and package inventory."
@@ -136,6 +142,169 @@ backup_config() {
 
 php_cli_version() {
   "$1" -v 2>/dev/null | sed -n '1s/^PHP \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -n1
+}
+
+# First upstream release that fixes CVE-2026-109618 and CVE-2026-109619.
+# PHP 8.1 and older have no upstream fix.
+cve_fixed_version() {
+  case "$1" in
+    8.2) printf '%s' 8.2.35 ;;
+    8.3) printf '%s' 8.3.36 ;;
+    8.4) printf '%s' 8.4.27 ;;
+    8.5) printf '%s' 8.5.12 ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when $1 >= $2 (dotted numeric versions).
+version_ge() {
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
+}
+
+# patched | affected | no-upstream-fix | unknown
+cve_status() {
+  local ver="$1" branch fix
+  [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] || { printf 'unknown'; return 0; }
+  branch="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+  if fix="$(cve_fixed_version "$branch")"; then
+    if version_ge "$ver" "$fix"; then printf 'patched'; else printf 'affected'; fi
+  elif version_ge "${branch}.0" "8.6.0"; then
+    printf 'unknown'
+  else
+    printf 'no-upstream-fix'
+  fi
+}
+
+cve_status_line() {
+  local ver="$1" status fix branch
+  status="$(cve_status "$ver")"
+  branch="${ver%.*}"
+  case "$status" in
+    patched)
+      printf 'PATCHED   %s  (CVE-2026-109618, CVE-2026-109619)\n' "$ver" ;;
+    affected)
+      fix="$(cve_fixed_version "$branch")"
+      printf 'AFFECTED  %s  needs >= %s  (CVE-2026-109618, CVE-2026-109619)\n' "$ver" "$fix" ;;
+    no-upstream-fix)
+      printf 'AFFECTED  %s  no upstream fix on PHP < 8.2; migrate to 8.2.35+  (CVE-2026-109618, CVE-2026-109619)\n' "$ver" ;;
+    *)
+      printf 'UNKNOWN   %s  not in the 21 Oct 2026 advisory table\n' "$ver" ;;
+  esac
+}
+
+branch_runtime_version() {
+  local b="$1" bin ver
+  for bin in "/usr/bin/php${b}" "/usr/sbin/php-fpm${b}"; do
+    [[ -x "$bin" ]] || continue
+    ver="$(php_cli_version "$bin" || true)"
+    [[ -n "$ver" ]] || continue
+    printf '%s' "$ver"
+    return 0
+  done
+  return 1
+}
+
+candidate_upstream() {
+  candidate_version "$1" | sed -nE 's/^(.*:)?([0-9]+\.[0-9]+\.[0-9]+).*/\2/p'
+}
+
+# Prints "upstream<TAB>status" for the best apt candidate of a branch.
+candidate_cve_status() {
+  local branch="$1" pkg ver
+  for pkg in "php${branch}-cli" "php${branch}-fpm" "libapache2-mod-php${branch}"; do
+    has_candidate "$pkg" || continue
+    ver="$(candidate_upstream "$pkg")"
+    [[ -n "$ver" ]] || continue
+    printf '%s\t%s' "$ver" "$(cve_status "$ver")"
+    return 0
+  done
+  return 1
+}
+
+# Refuse to upgrade or migrate onto a build that is still below the fix.
+require_cve_candidate() {
+  local branch="$1" cand_ver cand_status fix
+  if ! IFS=$'\t' read -r cand_ver cand_status < <(candidate_cve_status "$branch"); then
+    die "No apt candidate for PHP ${branch}, so CVE-2026-109618 / CVE-2026-109619 cannot be patched. Enable a repo that ships a fixed build (ondrej/php) and retry."
+  fi
+  case "$cand_status" in
+    patched)
+      log "Apt candidate for PHP ${branch} is ${cand_ver}, which fixes CVE-2026-109618 / CVE-2026-109619."
+      ;;
+    no-upstream-fix)
+      die "PHP ${branch} has no upstream fix for CVE-2026-109618 / CVE-2026-109619. Migrate to 8.2.35 or newer (action 4)."
+      ;;
+    affected)
+      fix="$(cve_fixed_version "$branch" || true)"
+      die "Apt candidate for PHP ${branch} is ${cand_ver}, below the fixed release ${fix} (CVE-2026-109618, CVE-2026-109619)."
+      ;;
+    *)
+      die "PHP ${branch} candidate ${cand_ver} is not in the 21 Oct 2026 advisory table. Refusing to treat it as patched."
+      ;;
+  esac
+}
+
+verify_branch_cve() {
+  local branch="$1" ver status
+  ver="$(branch_runtime_version "$branch" || true)"
+  [[ -n "$ver" ]] || die "Could not read PHP ${branch} version after the change."
+  status="$(cve_status "$ver")"
+  log "$(cve_status_line "$ver")"
+  [[ "$status" == patched ]] || die "PHP ${branch} is ${ver} and is still affected by CVE-2026-109618 / CVE-2026-109619."
+}
+
+print_cve_report() {
+  local b ver
+  echo "CVE-2026-109618 / CVE-2026-109619:"
+  echo "  Fixed in 8.2.35, 8.3.36, 8.4.27, 8.5.12. No upstream fix before PHP 8.2."
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    if ver="$(branch_runtime_version "$b")"; then
+      printf '  PHP %-4s %s\n' "$b" "$(cve_status_line "$ver")"
+    else
+      printf '  PHP %-4s version unreadable\n' "$b"
+    fi
+  done < <(list_installed_branches)
+}
+
+# 0 when every installed branch reads as patched. 1 when any is still open.
+cve_exposure_open() {
+  local b ver status open=0 seen=0
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    seen=1
+    ver="$(branch_runtime_version "$b" || true)"
+    [[ -n "$ver" ]] || { open=1; continue; }
+    status="$(cve_status "$ver")"
+    [[ "$status" == patched ]] || open=1
+  done < <(list_installed_branches)
+  [[ "$seen" -eq 1 && "$open" -eq 0 ]]
+}
+
+self_check_cve() {
+  local fail=0 got
+  expect() {
+    got="$(cve_status "$1")"
+    if [[ "$got" == "$2" ]]; then
+      printf 'ok  %s -> %s\n' "$1" "$got"
+    else
+      printf 'FAIL %s -> %s (want %s)\n' "$1" "$got" "$2"
+      fail=1
+    fi
+  }
+  expect 8.2.34 affected
+  expect 8.2.35 patched
+  expect 8.3.35 affected
+  expect 8.3.36 patched
+  expect 8.4.26 affected
+  expect 8.4.27 patched
+  expect 8.5.11 affected
+  expect 8.5.12 patched
+  expect 8.1.33 no-upstream-fix
+  expect 7.4.33 no-upstream-fix
+  expect 8.6.0 unknown
+  [[ "$fail" -eq 0 ]] || exit 1
+  echo "cve self-check ok"
 }
 
 active_apache_fpm_branch() {
@@ -252,6 +421,8 @@ show_audit() {
   echo "Installed PHP packages (first 100):"
   dpkg-query -W -f='${binary:Package}\t${Version}\n' 'php*' 'libapache2-mod-php*' 2>/dev/null \
     | grep -E '^(php[0-9]+\.[0-9]+|libapache2-mod-php[0-9]+\.[0-9]+)' | sort -u | head -100 || true
+  echo
+  print_cve_report
   echo "===================================================="
   echo
 }
@@ -338,11 +509,13 @@ update_branch_packages() {
   backup_config
   log "Refreshing apt metadata."
   apt-get update 2>&1 | tee -a "$LOG_FILE"
+  require_cve_candidate "$branch"
   ask_yes_no "Proceed with package upgrade?" || { log "Cancelled before package upgrade."; return 0; }
 
   _upgrade_branch_pkgs "$branch"
   restart_active_handlers
-  log "Update finished. Test the application and review $LOG_FILE."
+  verify_branch_cve "$branch"
+  log "Update finished. PHP ${branch} is at a release that fixes CVE-2026-109618 / CVE-2026-109619. Test the application and review $LOG_FILE."
 }
 
 update_all_branches() {
@@ -360,11 +533,27 @@ update_all_branches() {
   apt-get update 2>&1 | tee -a "$LOG_FILE"
   ask_yes_no "Proceed with upgrading all installed PHP branches?" || { log "Cancelled before upgrade."; return 0; }
 
+  local -a skipped=()
+  local cand_ver cand_status
   for b in "${branches[@]}"; do
+    if ! IFS=$'\t' read -r cand_ver cand_status < <(candidate_cve_status "$b"); then
+      log "WARNING: no apt candidate for PHP ${b}; left unchanged."
+      skipped+=("$b")
+      continue
+    fi
+    if [[ "$cand_status" != patched ]]; then
+      log "WARNING: PHP ${b} candidate ${cand_ver} does not fix CVE-2026-109618 / CVE-2026-109619 (${cand_status}). Not upgrading this branch."
+      skipped+=("$b")
+      continue
+    fi
     _upgrade_branch_pkgs "$b"
+    verify_branch_cve "$b"
   done
   restart_active_handlers
-  log "All-branch update finished. Test the application and review $LOG_FILE."
+  if ((${#skipped[@]} > 0)); then
+    die "Still exposed to CVE-2026-109618 / CVE-2026-109619: ${skipped[*]}. PHP older than 8.2 must be migrated (action 4) to 8.2.35 or newer."
+  fi
+  log "All-branch update finished. Every installed branch fixes CVE-2026-109618 / CVE-2026-109619. Test the application and review $LOG_FILE."
 }
 
 copy_ini_directive() {
@@ -465,6 +654,7 @@ migrate_fpm() {
   # Fail early (before installing anything) if the target branch is not available.
   has_candidate "php${to}-fpm" || die "No installable candidate for php${to}-fpm. Enable a repo that ships it first, e.g.:
   sudo add-apt-repository ppa:ondrej/php && sudo apt-get update"
+  require_cve_candidate "$to"
 
   # Install target-branch equivalents of the extensions installed for the source.
   while IFS= read -r oldpkg; do
@@ -525,6 +715,8 @@ migrate_fpm() {
   systemctl is-active --quiet "php${to}-fpm" || die "PHP ${to} FPM is not active."
   systemctl is-active --quiet apache2 || die "Apache is not active."
   log "Migration finished. PHP ${from} packages/service were deliberately retained."
+  verify_branch_cve "$to"
+  log "PHP ${to} is at a release that fixes CVE-2026-109618 / CVE-2026-109619. PHP ${from} is still installed and still affected until you purge it (action 5)."
 
   # The CLI default (/usr/bin/php) is separate from the Apache handler.
   if have update-alternatives; then
@@ -659,7 +851,15 @@ main() {
   fi
 
   case "$choice" in
-    1) log "Audit only; no system changes made."; echo "Audit complete. No changes made." ;;
+    1)
+      if cve_exposure_open; then
+        log "Audit: one or more PHP branches are still affected by CVE-2026-109618 / CVE-2026-109619."
+        echo "Audit complete. PHP is still affected; see the CVE lines above."
+        exit 1
+      fi
+      log "Audit: installed PHP fixes CVE-2026-109618 / CVE-2026-109619."
+      echo "Audit complete. Installed PHP is at a fixed release."
+      ;;
     2) run_update_action ;;
     3) update_all_branches ;;
     4) run_migrate_action ;;
@@ -668,5 +868,10 @@ main() {
     *) die "Invalid selection: ${choice}" ;;
   esac
 }
+
+if [[ "$SELF_CHECK" -eq 1 ]]; then
+  self_check_cve
+  exit 0
+fi
 
 main

@@ -1,6 +1,6 @@
 # php-safe-upgrade
 
-**Safely patch PHP on Ubuntu + Apache** — audit, upgrade, migrate PHP-FPM between versions, and clean up old branches, without breaking a running site. Built for applying the October 2026 PHP security releases on production Laravel/PHP servers, but useful for any routine PHP upgrade.
+**Safely patch PHP on Ubuntu + Apache** — audit, upgrade, migrate PHP-FPM between versions, and clean up old branches, without breaking a running site. It checks two critical engine bugs from the 21 October 2026 security release, [CVE-2026-109618](https://www.php.net/archive/2026.php#2026-10-21-5) and [CVE-2026-109619](https://www.php.net/archive/2026.php#2026-10-21-5). Both can allow unauthenticated remote code execution. Updating to a fixed release is the only complete fix.
 
 Backup-first, confirmation-gated, and idempotent. It never removes the active runtime, and validates Apache before switching anything.
 
@@ -29,10 +29,10 @@ Always read a script before piping it to a root shell.
 
 | Action | Description |
 | --- | --- |
-| 1 Audit | Report OS, CLI versions, Apache handler, FPM services, installed packages. No changes. |
-| 2 Update active branch | Upgrade only the installed packages of the branch Apache uses, then restart FPM / Apache. |
-| 3 Update all branches | Same, for every installed PHP branch — patches idle CLI-only versions too. |
-| 4 Migrate FPM | Install a new FPM branch alongside the old, carry over php.ini + pool.d settings, validate, switch, keep old for rollback. |
+| 1 Audit | Report OS, CLI versions, Apache handler, FPM services, installed packages, and whether each branch fixes CVE-2026-109618 / CVE-2026-109619. No changes. Exits non-zero if any branch is still affected. |
+| 2 Update active branch | Upgrade only the installed packages of the branch Apache uses, then restart FPM / Apache. Refuses to run unless the apt candidate is a fixed release, and checks `php -v` afterwards. |
+| 3 Update all branches | Same, for every installed branch whose apt candidate is a fixed release. Exits non-zero if any branch is still affected (PHP 8.1 and older cannot be patched in place). |
+| 4 Migrate FPM | Install a new FPM branch alongside the old, carry over php.ini + pool.d settings, validate, switch, keep old for rollback. The target candidate must be a fixed release (8.2.35 or newer). |
 | 5 Purge old branch | Disable + purge an inactive branch. Refuses the active handler, scans for references, confirms first. |
 
 ## Usage
@@ -64,9 +64,21 @@ Ubuntu/Debian with apt, Apache (mod_php or PHP-FPM), root.
 
 For migrations the target branch must be installable — on stock Ubuntu that usually means the `ondrej/php` PPA. The script detects a missing candidate and tells you.
 
-## Note on the CVEs
+## Affected versions
 
-Confirm exact fixed versions and your package's patch status against the official [php.net](https://www.php.net) advisory and your distro's security notices before declaring a server fixed — a version number alone, or a backported distro package, may not tell the whole story.
+CVE-2026-109618 and CVE-2026-109619 are in the PHP engine. They are not fixed by application code, a WAF rule, or an Ubuntu package bump that stays on an unfixed upstream version.
+
+| Branch | Affected | First fixed release |
+| --- | --- | --- |
+| 8.5 | 8.5.0 – 8.5.11 | 8.5.12 |
+| 8.4 | 8.4.0 – 8.4.26 | 8.4.27 |
+| 8.3 | 8.3.0 – 8.3.35 | 8.3.36 |
+| 8.2 | 8.2.0 – 8.2.34 | 8.2.35 |
+| 8.1 and older | Affected | No upstream fix. Migrate to 8.2.35 or newer. |
+
+The audit prints `PATCHED` or `AFFECTED` from `php -v` for every installed branch. Actions 2 and 4 stop before changing the system if apt's candidate is still below that floor. Action 3 upgrades only the branches whose candidate is fixed, then fails if anything (typically PHP 8.1) is still exposed so you can migrate it with action 4 and remove it with action 5.
+
+A distro package whose `php -v` string is still below the fixed release is treated as affected, even if the Debian revision number changed. Confirm the result against the [php.net advisory](https://www.php.net/archive/2026.php#2026-10-21-5) if a vendor says they backported the fix without bumping that version.
 
 ## License
 
