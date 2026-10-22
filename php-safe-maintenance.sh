@@ -217,7 +217,7 @@ candidate_cve_status() {
     has_candidate "$pkg" || continue
     ver="$(candidate_upstream "$pkg")"
     [[ -n "$ver" ]] || continue
-    printf '%s\t%s' "$ver" "$(cve_status "$ver")"
+    printf '%s\t%s\n' "$ver" "$(cve_status "$ver")"
     return 0
   done
   return 1
@@ -333,7 +333,8 @@ installed_php_packages_for_branch() {
 }
 
 candidate_version() {
-  apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}'
+  # Read all input: an early awk exit SIGPIPEs apt-cache and trips pipefail.
+  apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ && !seen {print $2; seen=1}'
 }
 
 has_candidate() {
