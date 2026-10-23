@@ -23,6 +23,10 @@ printf '%s\n' 'ii  php8.2-cli' 'ii  php8.3-common' 'ii  php8.3-intl'
 EOF
 cat > "$tmp/bin/apt-get" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${FAKE_LOCK:-}" == 1 ]]; then
+  echo "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 1 (apt-get)"
+  exit 100
+fi
 echo "E: Problem executing scripts APT::Update::Post-Invoke-Success"
 exit 100
 EOF
@@ -32,6 +36,7 @@ chmod +x "$tmp/bin/dpkg-query" "$tmp/bin/apt-get"
   echo 'set -Eeuo pipefail'
   echo 'LOG_FILE=/dev/null; APT_UPDATE_OPTS=()'
   echo 'log() { echo "$*"; }'
+  echo 'die() { echo "DIE: $*"; exit 1; }'
   sed -n '/^ere_escape()/p' php-safe-maintenance.sh
   sed -n '/^php_cli_version()/,/^self_check_cve()/p' php-safe-maintenance.sh | sed '$d'
   sed -n '/^installed_package_names()/,/^}/p;/^list_installed_branches()/,/^}/p;/^apt_update()/,/^}/p' php-safe-maintenance.sh
@@ -45,5 +50,8 @@ out="$(PATH="$tmp/bin:$PATH" bash "$tmp/run.sh")"
 [[ "$out" == *"PHP 8.3  NOT RUNNABLE"* ]] || { echo "8.3 not reported as not runnable: $out"; exit 1; }
 [[ "$out" == *ALL_PATCHED* ]] || { echo "extension-only 8.3 blocked all-patched: $out"; exit 1; }
 [[ "$out" == *UPDATE_CONTINUED* ]] || { echo "apt-get update hook error aborted: $out"; exit 1; }
+
+out="$(PATH="$tmp/bin:$PATH" FAKE_LOCK=1 bash "$tmp/run.sh" || true)"
+[[ "$out" == *"package lock"* && "$out" != *UPDATE_CONTINUED* ]] || { echo "apt lock did not stop the run: $out"; exit 1; }
 
 echo "runtime and update check ok"

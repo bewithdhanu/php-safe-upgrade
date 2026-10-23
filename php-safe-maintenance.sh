@@ -517,7 +517,14 @@ restart_active_handlers() {
 # command-not-found refresh under a swapped python3). The candidate check that
 # follows every update is what decides whether a fixed build is available.
 apt_update() {
-  if ! apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+  local out rc=0
+  # Capture first so a lock error can stop the run before a stale index is trusted.
+  out="$(apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | tee -a "$LOG_FILE" >/dev/null
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ "$out" == *"Could not get lock"* ]]; then
+      die "Another apt process holds the package lock, so the package index was not refreshed. Wait until it finishes, then rerun this script. Nothing was changed."
+    fi
     log "WARNING: apt-get update reported an error. Continuing; the fixed-version check below still applies."
   fi
 }
@@ -596,7 +603,7 @@ update_all_branches() {
   ask_yes_no "Proceed with upgrading all installed PHP branches?" || { log "Cancelled before upgrade."; return 0; }
 
   local -a skipped=()
-  local cand_ver cand_status
+  local cand_ver cand_status need_migrate=0 need_retry=0
   for b in "${branches[@]}"; do
     if ! branch_has_runtime "$b"; then
       log "PHP ${b} has extension packages only and no PHP program; nothing to patch. Skipping."
@@ -605,11 +612,13 @@ update_all_branches() {
     if ! IFS=$'\t' read -r cand_ver cand_status < <(candidate_cve_status "$b"); then
       log "WARNING: no apt candidate for PHP ${b}; left unchanged."
       skipped+=("$b")
+      need_retry=1
       continue
     fi
     if [[ "$cand_status" != patched ]]; then
       log "WARNING: PHP ${b} candidate ${cand_ver} does not fix CVE-2026-109618 / CVE-2026-109619 (${cand_status}). Not upgrading this branch."
       skipped+=("$b")
+      if [[ "$cand_status" == no-upstream-fix ]]; then need_migrate=1; else need_retry=1; fi
       continue
     fi
     _upgrade_branch_pkgs "$b"
@@ -617,7 +626,14 @@ update_all_branches() {
   done
   restart_active_handlers
   if ((${#skipped[@]} > 0)); then
-    die "Still exposed to CVE-2026-109618 / CVE-2026-109619: ${skipped[*]}. PHP older than 8.2 must be migrated (action 4) to 8.2.35 or newer."
+    local msg="Still exposed to CVE-2026-109618 / CVE-2026-109619: ${skipped[*]}."
+    if ((need_migrate)); then
+      msg+=" PHP older than 8.2 has no upstream fix and must be migrated (action 4) to 8.2.35 or newer."
+    fi
+    if ((need_retry)); then
+      msg+=" Apt is not offering a fixed build for a branch that has one. Wait for any other apt process to finish, then rerun this command. Do not migrate that branch."
+    fi
+    die "$msg"
   fi
   log "All-branch update finished. Every installed branch fixes CVE-2026-109618 / CVE-2026-109619. Test the application and review $LOG_FILE."
 }
