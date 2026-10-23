@@ -855,12 +855,21 @@ run_purge_action() {
   fi
 
   log "Purging PHP ${branch} packages."
-  apt-get "${APT_OPTS[@]}" purge "${pkgs[@]}" 2>&1 | tee -a "$LOG_FILE"
+  if ! apt-get "${APT_OPTS[@]}" purge "${pkgs[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    log "WARNING: apt-get reported an error. Checking whether the PHP ${branch} packages are gone."
+  fi
+  local left
+  left="$(installed_php_packages_for_branch "$branch" | tr '\n' ' ')"
+  [[ -z "${left// /}" ]] || die "These PHP ${branch} packages are still installed: ${left}"
+  log "All PHP ${branch} packages are removed."
 
   if ask_yes_no "Run 'apt-get autoremove' to drop now-unused dependencies?"; then
     echo "autoremove would remove:"
     apt-get --dry-run autoremove 2>/dev/null | awk '/^Remv/ {print "  " $2}' || true
-    ask_yes_no "Proceed with autoremove?" && apt-get "${APT_OPTS[@]}" autoremove 2>&1 | tee -a "$LOG_FILE"
+    if ask_yes_no "Proceed with autoremove?"; then
+      apt-get "${APT_OPTS[@]}" autoremove 2>&1 | tee -a "$LOG_FILE" \
+        || log "WARNING: apt-get autoremove reported an error; continuing with the health checks."
+    fi
   fi
 
   restart_active_handlers
