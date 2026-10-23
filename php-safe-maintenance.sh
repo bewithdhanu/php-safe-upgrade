@@ -327,9 +327,16 @@ active_mod_php_branch() {
   done | head -n1
 }
 
+# Package names whose files are on disk. Removed packages that only left config
+# behind ("rc") are skipped: apt cannot upgrade them.
+installed_package_names() {
+  dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null \
+    | awk 'substr($1, 2, 1) !~ /[nc]/ {print $2}'
+}
+
 installed_php_packages_for_branch() {
   local b_re; b_re="$(ere_escape "$1")"
-  dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
+  installed_package_names \
     | grep -E "^php${b_re}(:[^[:space:]]+)?$|^php${b_re}-|^libapache2-mod-php${b_re}(:[^[:space:]]+)?$" \
     | sort -u || true
 }
@@ -452,7 +459,7 @@ warn_vhost_handlers() {
 # List every installed PHP branch (e.g. "8.1", "8.2"), including an idle CLI-only
 # branch that is not the active web runtime but may still be vulnerable.
 list_installed_branches() {
-  dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
+  installed_package_names \
     | sed -nE 's/^php([0-9]+\.[0-9]+)(-.*|:.*)?$/\1/p; s/^libapache2-mod-php([0-9]+\.[0-9]+)(:.*)?$/\1/p' \
     | sort -u
 }
