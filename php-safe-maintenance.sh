@@ -272,7 +272,7 @@ print_cve_report() {
 }
 
 # 0 when every installed branch reads as patched. 1 when any is still open.
-cve_exposure_open() {
+all_branches_patched() {
   local b ver status open=0 seen=0
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
@@ -311,12 +311,18 @@ self_check_cve() {
   echo "cve self-check ok"
 }
 
-active_apache_fpm_branch() {
+enabled_apache_fpm_branches() {
   local f
   for f in /etc/apache2/conf-enabled/php*-fpm.conf; do
     [[ -e "$f" ]] || continue
     basename "$f" | sed -n 's/^php\([0-9]\+\.[0-9]\+\)-fpm\.conf$/\1/p'
-  done | head -n1
+  done | sort -V
+}
+
+# Apache includes conf-enabled/*.conf in sorted order and the last SetHandler
+# wins, so with several FPM confs enabled the highest one serves requests.
+active_apache_fpm_branch() {
+  enabled_apache_fpm_branches | tail -n1
 }
 
 active_mod_php_branch() {
@@ -416,6 +422,9 @@ show_audit() {
   echo "Apache PHP handler:"
   if [[ -n "$fpm_branch" ]]; then
     echo "  PHP ${fpm_branch}-FPM config enabled"
+    if [[ "$(enabled_apache_fpm_branches | wc -l)" -gt 1 ]]; then
+      echo "  NOTE: several FPM confs are enabled ($(enabled_apache_fpm_branches | tr '\n' ' ')); Apache serves PHP ${fpm_branch}, the last one loaded."
+    fi
     grep -hE 'SetHandler.*php[0-9]+\.[0-9]+-fpm\.sock' "/etc/apache2/conf-enabled/php${fpm_branch}-fpm.conf" 2>/dev/null | head -n2 || true
   elif [[ -n "$mod_branch" ]]; then
     echo "  mod_php ${mod_branch} enabled"
@@ -423,7 +432,7 @@ show_audit() {
     echo "  Standard PHP FPM/mod_php handler not detected"
   fi
   echo "FPM services:"
-  for branch in 8.1 8.2 8.3 8.4 8.5; do
+  for branch in $(list_installed_branches); do
     if systemctl list-unit-files "php${branch}-fpm.service" --no-legend 2>/dev/null | grep -q "php${branch}-fpm.service"; then
       printf '  php%-7s active=%-8s enabled=%s\n' "${branch}-fpm" \
         "$(systemctl is-active "php${branch}-fpm" 2>/dev/null || true)" \
@@ -882,7 +891,7 @@ main() {
 
   case "$choice" in
     1)
-      if cve_exposure_open; then
+      if ! all_branches_patched; then
         log "Audit: one or more PHP branches are still affected by CVE-2026-109618 / CVE-2026-109619."
         echo "Audit complete. PHP is still affected; see the CVE lines above."
         exit 1
