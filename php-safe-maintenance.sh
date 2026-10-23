@@ -257,6 +257,17 @@ verify_branch_cve() {
   [[ "$status" == patched ]] || die "PHP ${branch} is ${ver} and is still affected by CVE-2026-109618 / CVE-2026-109619."
 }
 
+# A branch with only extension packages (e.g. php8.3-common pulled in by the
+# php-intl metapackage) has no interpreter, so nothing can execute it.
+branch_has_runtime() {
+  local b="$1" f
+  for f in "/usr/bin/php${b}" "/usr/sbin/php-fpm${b}" "/usr/bin/php-cgi${b}" \
+           "/usr/lib/apache2/modules/libphp${b}.so"; do
+    [[ -e "$f" ]] && return 0
+  done
+  return 1
+}
+
 print_cve_report() {
   local b ver
   echo "CVE-2026-109618 / CVE-2026-109619:"
@@ -265,17 +276,20 @@ print_cve_report() {
     [[ -n "$b" ]] || continue
     if ver="$(branch_runtime_version "$b")"; then
       printf '  PHP %-4s %s\n' "$b" "$(cve_status_line "$ver")"
+    elif branch_has_runtime "$b"; then
+      printf '  PHP %-4s UNKNOWN   installed but version unreadable; treating as affected\n' "$b"
     else
-      printf '  PHP %-4s version unreadable\n' "$b"
+      printf '  PHP %-4s NOT RUNNABLE  extension packages only, no PHP %s program installed\n' "$b" "$b"
     fi
   done < <(list_installed_branches)
 }
 
-# 0 when every installed branch reads as patched. 1 when any is still open.
+# 0 when every runnable branch reads as patched. 1 when any is still open.
 all_branches_patched() {
   local b ver status open=0 seen=0
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
+    branch_has_runtime "$b" || continue
     seen=1
     ver="$(branch_runtime_version "$b" || true)"
     [[ -n "$ver" ]] || { open=1; continue; }
@@ -499,6 +513,15 @@ restart_active_handlers() {
   fi
 }
 
+# apt-get update also exits non-zero when an unrelated hook fails (e.g. the
+# command-not-found refresh under a swapped python3). The candidate check that
+# follows every update is what decides whether a fixed build is available.
+apt_update() {
+  if ! apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    log "WARNING: apt-get update reported an error. Continuing; the fixed-version check below still applies."
+  fi
+}
+
 # Run apt-get install, then judge success by the requested PHP packages only.
 # An unrelated half-configured package (e.g. shim-signed on EC2) makes apt-get
 # exit non-zero even when every PHP package installed cleanly.
@@ -547,7 +570,7 @@ update_branch_packages() {
 
   backup_config
   log "Refreshing apt metadata."
-  apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"
+  apt_update
   require_cve_candidate "$branch"
   ask_yes_no "Proceed with package upgrade?" || { log "Cancelled before package upgrade."; return 0; }
 
@@ -569,12 +592,16 @@ update_all_branches() {
 
   backup_config
   log "Refreshing apt metadata."
-  apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"
+  apt_update
   ask_yes_no "Proceed with upgrading all installed PHP branches?" || { log "Cancelled before upgrade."; return 0; }
 
   local -a skipped=()
   local cand_ver cand_status
   for b in "${branches[@]}"; do
+    if ! branch_has_runtime "$b"; then
+      log "PHP ${b} has extension packages only and no PHP program; nothing to patch. Skipping."
+      continue
+    fi
     if ! IFS=$'\t' read -r cand_ver cand_status < <(candidate_cve_status "$b"); then
       log "WARNING: no apt candidate for PHP ${b}; left unchanged."
       skipped+=("$b")
@@ -688,7 +715,7 @@ migrate_fpm() {
 
   backup_config
   log "Refreshing apt metadata."
-  apt-get update "${APT_UPDATE_OPTS[@]}" 2>&1 | tee -a "$LOG_FILE"
+  apt_update
 
   # Fail early (before installing anything) if the target branch is not available.
   has_candidate "php${to}-fpm" || die "No installable candidate for php${to}-fpm. Enable a repo that ships it first, e.g.:
