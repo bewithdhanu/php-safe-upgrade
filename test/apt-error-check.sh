@@ -10,6 +10,10 @@ trap 'rm -rf "$tmp"' EXIT
 
 cat > "$tmp/apt-get" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${FAKE_DPKG_LOCK:-}" == 1 ]]; then
+  echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 1 (unattended-upgr)"
+  exit 100
+fi
 echo "dpkg: error processing package shim-signed (--configure):"
 echo "E: Sub-process /usr/bin/dpkg returned an error code (1)"
 exit 100
@@ -37,5 +41,9 @@ out="$(PATH="$tmp:$PATH" bash "$tmp/run.sh")"
 out="$(PATH="$tmp:$PATH" FAKE_BROKEN=php8.2-fpm bash "$tmp/run.sh" || true)"
 [[ "$out" == *"not fully installed: php8.2-fpm(iF )"* && "$out" != *PASS* ]] \
   || { echo "broken PHP package was accepted: $out"; exit 1; }
+
+out="$(PATH="$tmp:$PATH" FAKE_DPKG_LOCK=1 bash "$tmp/run.sh" || true)"
+[[ "$out" == *"dpkg lock"* && "$out" != *PASS* ]] \
+  || { echo "dpkg lock was treated as a successful install: $out"; exit 1; }
 
 echo "apt error check ok"

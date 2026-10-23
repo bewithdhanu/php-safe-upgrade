@@ -533,10 +533,15 @@ apt_update() {
 # An unrelated half-configured package (e.g. shim-signed on EC2) makes apt-get
 # exit non-zero even when every PHP package installed cleanly.
 apt_install_php() {
-  local pkg status
+  local pkg status out rc=0
   local -a requested=() broken=()
   for pkg in "$@"; do [[ "$pkg" == -* ]] || requested+=("$pkg"); done
-  if ! apt-get "${APT_OPTS[@]}" install "$@" 2>&1 | tee -a "$LOG_FILE"; then
+  out="$(apt-get "${APT_OPTS[@]}" install "$@" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | tee -a "$LOG_FILE" >/dev/null
+  if [[ "$rc" -ne 0 && "$out" == *"Could not get lock"* ]]; then
+    die "Another apt process holds the dpkg lock, so the PHP packages were not upgraded. Wait until it finishes (or stop it if it has been stuck for days), then rerun this script."
+  fi
+  if [[ "$rc" -ne 0 ]]; then
     log "WARNING: apt-get reported an error. Checking whether the PHP packages themselves installed cleanly."
   fi
   for pkg in "${requested[@]}"; do
